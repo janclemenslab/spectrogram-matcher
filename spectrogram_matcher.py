@@ -156,7 +156,7 @@ class QueryResult:
     proposals: List[LabeledProposal]  # order: 20 nn then 20 quantiles
 
 class SpectrogramMatcher(QtWidgets.QMainWindow):
-    def __init__(self, h5_path="res/embeddings.h5", annotator_name: str = "", parent=None):
+    def __init__(self, h5_path="embeddings.h5", annotator_name: str = "", parent=None):
         super().__init__(parent)
         self.setWindowTitle("Spectrogram Matcher")
         self.resize(1000, 860)
@@ -429,8 +429,8 @@ def main():
     parser = argparse.ArgumentParser(description="Spectrogram Matcher GUI")
     parser.add_argument("--annotator", dest="annotator", type=str, default="",
                         help="Annotator name (prefills the GUI and is saved to JSON)")
-    parser.add_argument("--h5", dest="h5_path", type=str, default="res/embeddings.h5",
-                        help="Path to embeddings HDF5 (default: res/embeddings.h5)")
+    parser.add_argument("--h5", dest="h5_path", type=str, default="embeddings.h5",
+                        help="Path to embeddings HDF5 (default: embeddings.h5)")
     args, unknown = parser.parse_known_args()
     # Keep unknown args for Qt
     sys.argv = [sys.argv[0]] + unknown

@@ -27,9 +27,6 @@ cd spectrogram-matcher
 
 ```bash
 conda create -n sm -y python=3.13 PySide6 numpy h5py matplotlib -c conda-forge
-conda activate sm
-git clone https://github.com/janclemenslab/spectrogram-matcher.git
-cd spectrogram-matcher
 ```
 
 2. Download the data from this [link](https://www.dropbox.com/scl/fi/gsgrppkc91xee5i5x0klf/embeddings.h5?rlkey=k0tmb5pj6myg4i7ju5mj36uzc&dl=0) and put it in the same folder as the file `spectrogram_matcher.py`
@@ -39,9 +36,10 @@ cd spectrogram-matcher
 
 ## ▶️ Usage
 
-Run the application:
+Change into the directory with the `spectrogram_matcher.py` and `embeddings.h5` file and run the application:
 
 ```bash
+conda activate sm
 python spectrogram_matcher.py --annotator YOURNAME
 ```
 
