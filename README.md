@@ -32,6 +32,11 @@ git clone https://github.com/janclemenslab/spectrogram-matcher.git
 cd spectrogram-matcher
 ```
 
+2. Download the data from this [link](https://www.dropbox.com/scl/fi/gsgrppkc91xee5i5x0klf/embeddings.h5?rlkey=k0tmb5pj6myg4i7ju5mj36uzc&dl=0) and put it in the same folder as the file `spectrogram_matcher.py`
+
+
+
+
 ## ▶️ Usage
 
 Run the application:
