@@ -1,0 +1,49 @@
+# Spectrogram Matcher
+
+A PySide6 GUI tool for interactively matching spectrograms.
+The tool:
+
+- Loads spectrograms and their embeddings from an HDF5 file.
+- Computes pairwise cosine distances between all spectrogram embeddings.
+- Lets you pick a **query spectrogram**.
+- Shows two proposal sets:
+  1. **20 nearest neighbours** (lowest cosine distance)
+  2. **20 quantile-ranked** examples from the query’s distance distribution
+- Lets you label each proposal as **Match** or **No match**.
+- Lets you save your annotations to a JSON file.
+
+---
+
+## 📦 Installation
+
+1. Clone or download this repository:
+
+```bash
+git clone https://github.com/janclemenslab/spectrogram-matcher.git
+cd spectrogram-matcher
+```
+
+2. Install dependencies:
+
+```bash
+conda create -n sm -y python=3.13 PySide6 numpy h5py matplotlib -c conda-forge
+conda activate sm
+git clone https://github.com/janclemenslab/spectrogram-matcher.git
+cd spectrogram-matcher
+```
+
+## ▶️ Usage
+
+Run the application:
+
+```bash
+python spectrogram_matcher.py --annotator YOURNAME
+```
+
+
+## ⌨️ Shortcuts
+
+- **Ctrl+S** — Save results
+- **N** — Next query
+- **R** — Pick random query
+
