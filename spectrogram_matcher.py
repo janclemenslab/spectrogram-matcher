@@ -139,6 +139,13 @@ class ProposalRow(QtWidgets.QFrame):
         self.label = bool(checked)
         self.labeledChanged.emit()
 
+    def set_match(self, match: bool):
+        # Update UI checkbox and internal label without emitting change twice
+        self.chkMatch.blockSignals(True)
+        self.chkMatch.setChecked(bool(match))
+        self.chkMatch.blockSignals(False)
+        self.label = bool(match)
+
 # ---------------------------- Main Window -------------------------------------
 
 @dataclass
@@ -169,6 +176,12 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
         self.results: List[QueryResult] = []
         self.results_path = "results.json"
 
+        # In-memory saved labels: query_index -> (proposal_index -> (timestamp, match))
+        self._saved_match_state: dict[int, dict[int, Tuple[float, bool]]] = {}
+
+        self.num_nn_idx = 20
+        self.num_quantile_idx = 20
+
         # ----- Layout constants -----
         IMG_HEIGHT = 90                    # half the previous height
         SIDEPANEL_WIDTH = 120              # fixed width for checkbox column
@@ -196,6 +209,11 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
         self.queryCombo = QtWidgets.QComboBox()
         self.queryCombo.addItems([f"{i}" for i in range(self.N)])
         self.queryCombo.currentIndexChanged.connect(self.on_query_changed)
+
+        # --- Make view more compact ---
+        view = QtWidgets.QListView(self.queryCombo)
+        view.setUniformItemSizes(True)
+        self.queryCombo.setView(view)
 
         self.btnRandom = QtWidgets.QPushButton("Random")
         self.btnRandom.clicked.connect(self.pick_random_query)
@@ -259,7 +277,16 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
         self.current_query: Optional[int] = None
         self.IMG_HEIGHT = IMG_HEIGHT
         self.SIDEPANEL_WIDTH = SIDEPANEL_WIDTH
+        # Load any existing annotations from JSON files in CWD
+        try:
+            self._load_annotations_from_dir(os.getcwd())
+        except Exception as e:
+            # Non-fatal: continue without preloaded annotations
+            print(f"Warning: failed to load annotations: {e}")
+
         self.set_query(0)
+        # Reflect annotations in query dropdown labels
+        self._refresh_all_query_item_labels()
 
     # -------------------- Data loading --------------------
 
@@ -290,6 +317,7 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
             self.queryCombo.clear()
             self.queryCombo.addItems([f"{i}" for i in range(self.N)])
             self.set_query(0)
+            self._refresh_all_query_item_labels()
 
     # -------------------- Query / proposals --------------------
 
@@ -310,10 +338,10 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
         order = order[order != self.current_query]  # drop self
 
         # 20 nearest neighbours
-        nn_idx = [int(i) for i in order[:20]]
+        nn_idx = [int(i) for i in order[:self.num_nn_idx]]
 
         # 20 quantiles (spread)
-        quant_idx = quantile_indices_from_sorted(order, 20)
+        quant_idx = quantile_indices_from_sorted(order, self.num_quantile_idx)
 
         # ensure uniqueness between buckets
         nn_set = set(nn_idx)
@@ -328,6 +356,8 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
 
         # populate proposals (single column, no headers)
         self._populate_proposals(nn_idx, q_unique, d)
+        # Apply any saved matches for this query
+        self._apply_saved_matches_for_query(self.current_query)
 
     def _populate_proposals(self, nn_idx: List[int], q_idx: List[int], dvec: np.ndarray):
         # clear
@@ -345,18 +375,44 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
                               bucket=("nn" if i in nn_idx else "quantile"),
                               img_height=self.IMG_HEIGHT,
                               sidepanel_width=self.SIDEPANEL_WIDTH)
-            row.labeledChanged.connect(self._noop_update_next)  # Next stays enabled
+            # Update Next button enabled and refresh in-memory state + labels
+            row.labeledChanged.connect(self._on_any_row_changed)
             self.proposalsLayout.addWidget(row)
 
         self.proposalsLayout.addStretch(1)
 
+    def _apply_saved_matches_for_query(self, q: int):
+        state = self._saved_match_state.get(int(q), {})
+        if not state:
+            return
+        for i in range(self.proposalsLayout.count()):
+            w = self.proposalsLayout.itemAt(i).widget()
+            if isinstance(w, ProposalRow):
+                if w.idx in state:
+                    _ts, match = state[w.idx]
+                    w.set_match(match)
+
     def _noop_update_next(self):
         self.btnNext.setEnabled(True)
 
+    def _on_any_row_changed(self):
+        # Enable Next and cache current labels to state (with timestamp)
+        self._noop_update_next()
+        self._cache_current_query_labels()
+        # Update current query label in dropdown
+        if self.current_query is not None:
+            self._update_query_item_label(int(self.current_query))
+
     def on_query_changed(self, idx):
+        # Cache current labels to in-memory state before switching
+        if self.current_query is not None:
+            self._cache_current_query_labels()
         self.set_query(idx)
 
     def pick_random_query(self):
+        # Cache current labels before switching
+        if self.current_query is not None:
+            self._cache_current_query_labels()
         q = int(np.random.randint(0, self.N))
         self.set_query(q)
 
@@ -383,6 +439,10 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
             proposals=self._collect_labels()
         )
         self.results.append(rec)
+        # Update in-memory saved state with recency
+        self._ingest_query_result_into_state(rec)
+        # Update dropdown mark for this query
+        self._update_query_item_label(rec.query_index)
         # autosave after each query
         self._write_results(self.results_path)
         nxt = (self.current_query + 1) % self.N
@@ -421,6 +481,114 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    # -------------------- Annotation loading/merging --------------------
+
+    def _ingest_query_result_into_state(self, rec: QueryResult):
+        q = int(rec.query_index)
+        ts = float(rec.timestamp)
+        if q not in self._saved_match_state:
+            self._saved_match_state[q] = {}
+        for p in rec.proposals:
+            idx = int(p.index)
+            match = bool(p.match)
+            prev = self._saved_match_state[q].get(idx)
+            if prev is None or ts >= prev[0]:
+                self._saved_match_state[q][idx] = (ts, match)
+
+    def _load_annotations_from_dir(self, directory: str):
+        # Load all *.json files that look like results produced by this tool
+        try:
+            files = [f for f in os.listdir(directory) if f.lower().endswith('.json')]
+        except Exception as e:
+            print(f"Warning: cannot list directory {directory}: {e}")
+            return
+
+        for fname in files:
+            fpath = os.path.join(directory, fname)
+            try:
+                with open(fpath, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+            except Exception:
+                continue  # skip non-JSON or unreadable
+
+            if not isinstance(data, dict) or 'results' not in data:
+                continue
+
+            file_mtime = 0.0
+            try:
+                file_mtime = os.path.getmtime(fpath)
+            except Exception:
+                pass
+
+            results = data.get('results') or []
+            if not isinstance(results, list):
+                continue
+
+            for rec in results:
+                try:
+                    q = int(rec.get('query_index'))
+                except Exception:
+                    continue
+                ts = rec.get('timestamp')
+                try:
+                    ts = float(ts) if ts is not None else float(file_mtime)
+                except Exception:
+                    ts = float(file_mtime)
+                annot = rec.get('proposals') or []
+                if not isinstance(annot, list):
+                    continue
+                # Build temporary QueryResult-like object to reuse ingest logic
+                props: List[LabeledProposal] = []
+                for p in annot:
+                    try:
+                        idx = int(p.get('index'))
+                    except Exception:
+                        continue
+                    match = bool(p.get('match', False))
+                    bucket = str(p.get('bucket', ''))
+                    dist = float(p.get('distance', 0.0)) if 'distance' in p else 0.0
+                    props.append(LabeledProposal(index=idx, distance=dist, bucket=bucket, match=match))
+                qr = QueryResult(query_index=q, timestamp=ts, annotator=str(rec.get('annotator', '')), proposals=props)
+                # Guard: only ingest indices within current dataset bounds
+                if 0 <= q < self.N:
+                    self._ingest_query_result_into_state(qr)
+        # After bulk load, refresh dropdown labels
+        self._refresh_all_query_item_labels()
+
+    def _cache_current_query_labels(self):
+        # Take current UI labels and store in in-memory state with current timestamp
+        try:
+            curr = int(self.current_query)
+        except Exception:
+            return
+        ts = time.time()
+        labels = self._collect_labels()
+        rec = QueryResult(query_index=curr, timestamp=ts, annotator=self.annotator_name(), proposals=labels)
+        self._ingest_query_result_into_state(rec)
+        # Ensure dropdown reflects current query state
+        self._update_query_item_label(curr)
+
+    # -------------------- Query label helpers --------------------
+
+    def _query_has_any_match(self, q: int) -> bool:
+        state = self._saved_match_state.get(int(q), {})
+        for _idx, (_ts, match) in state.items():
+            if match:
+                return True
+        return False
+
+    def _format_query_item_text(self, q: int) -> str:
+        mark = "✓ " if self._query_has_any_match(q) else ""
+        return f"{mark}{q}"
+
+    def _update_query_item_label(self, q: int):
+        if 0 <= q < self.queryCombo.count():
+            self.queryCombo.setItemText(q, self._format_query_item_text(q))
+
+    def _refresh_all_query_item_labels(self):
+        for q in range(self.queryCombo.count()):
+            self._update_query_item_label(q)
 
 # ---------------------------- main --------------------------------------------
 
