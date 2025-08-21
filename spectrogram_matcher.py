@@ -427,7 +427,7 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
                     index=w.idx,
                     distance=w.distance,
                     bucket=w.bucket,
-                    match=bool(w.label)
+                    match=bool(w.chkMatch.isChecked())
                 ))
         return labels
 
@@ -449,6 +449,12 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
         self.set_query(nxt)
 
     def save_results(self):
+        # Ensure any pending UI events are processed, then cache current state
+        try:
+            QtWidgets.QApplication.processEvents()
+        except Exception:
+            pass
+        self._cache_current_query_labels()
         self.results_path = self._make_results_filename()
         path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save results JSON", self.results_path, "JSON (*.json)")
         if path:
@@ -465,22 +471,44 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
         return f"results_{annot}_{ts}.json"
 
     def _write_results(self, path: str):
+        # Serialize from authoritative in-memory state so unsaved UI edits are included
+        results_list = self._state_to_results_list()
         payload = {
             "h5_path": os.path.abspath(self.h5_path),
             "created": time.strftime("%Y-%m-%d %H:%M:%S"),
             "n_items": int(self.N),
             "annotator": self.annotator_name(),
-            "results": [
-                {
-                    "query_index": r.query_index,
-                    "timestamp": r.timestamp,
-                    "annotator": r.annotator,
-                    "proposals": [asdict(lp) for lp in r.proposals],
-                } for r in self.results
-            ]
+            "results": results_list,
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    def _state_to_results_list(self) -> List[dict]:
+        out: List[dict] = []
+        for q in sorted(self._saved_match_state.keys()):
+            state = self._saved_match_state.get(q, {})
+            if not state:
+                continue
+            # Determine a representative timestamp: max over proposals
+            ts_q = max((ts for ts, _ in state.values()), default=time.time())
+            # Build proposals list with distances if available
+            props: List[LabeledProposal] = []
+            # Sort by index for stable output
+            for idx in sorted(state.keys()):
+                ts, match = state[idx]
+                dist = 0.0
+                try:
+                    dist = float(self.dist[q, idx])
+                except Exception:
+                    pass
+                props.append(LabeledProposal(index=idx, distance=dist, bucket="", match=bool(match)))
+            out.append({
+                "query_index": int(q),
+                "timestamp": float(ts_q),
+                "annotator": self.annotator_name(),
+                "proposals": [asdict(p) for p in props],
+            })
+        return out
 
     # -------------------- Annotation loading/merging --------------------
 
@@ -563,9 +591,27 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
         except Exception:
             return
         ts = time.time()
-        labels = self._collect_labels()
-        rec = QueryResult(query_index=curr, timestamp=ts, annotator=self.annotator_name(), proposals=labels)
-        self._ingest_query_result_into_state(rec)
+        # Only ingest changes: new True labels, or toggles relative to saved state
+        changed: List[LabeledProposal] = []
+        current_state = self._saved_match_state.get(curr, {})
+        for i in range(self.proposalsLayout.count()):
+            w = self.proposalsLayout.itemAt(i).widget()
+            if not isinstance(w, ProposalRow):
+                continue
+            prev = current_state.get(w.idx)
+            prev_match = prev[1] if prev is not None else None
+            curr_match = bool(w.chkMatch.isChecked())
+            if prev_match is None:
+                # New: only record True to avoid overwriting with False by default
+                if curr_match:
+                    changed.append(LabeledProposal(index=w.idx, distance=w.distance, bucket=w.bucket, match=True))
+            else:
+                if curr_match != bool(prev_match):
+                    changed.append(LabeledProposal(index=w.idx, distance=w.distance, bucket=w.bucket, match=curr_match))
+
+        if changed:
+            rec = QueryResult(query_index=curr, timestamp=ts, annotator=self.annotator_name(), proposals=changed)
+            self._ingest_query_result_into_state(rec)
         # Ensure dropdown reflects current query state
         self._update_query_item_label(curr)
 
