@@ -1,0 +1,5 @@
+scratch
+res
+*.json
+__*
+*.h5

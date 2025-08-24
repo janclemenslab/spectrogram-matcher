@@ -16,10 +16,12 @@ from matplotlib.figure import Figure
 
 # ---------------------------- Utilities ---------------------------------------
 
+
 def l2_normalize(x: np.ndarray, axis=1, eps=1e-12):
     n = np.linalg.norm(x, axis=axis, keepdims=True)
     n = np.maximum(n, eps)
     return x / n
+
 
 def cosine_dist_matrix(emb: np.ndarray) -> np.ndarray:
     # cosine distance = 1 - cosine similarity
@@ -30,17 +32,33 @@ def cosine_dist_matrix(emb: np.ndarray) -> np.ndarray:
     np.fill_diagonal(D, 0.0)
     return D
 
-def quantile_indices_from_sorted(sorted_indices: np.ndarray, count: int) -> List[int]:
-    """Evenly spaced ranks from a sorted ascending index list (self removed upstream)."""
+
+def quantile_indices_from_sorted(
+    sorted_indices: np.ndarray, count: int, bias_exponent: float = 0.1
+) -> List[int]:
+    """
+    Return `count` indices sampled from an ascending rank list with a bias
+    towards smaller ranks (closer neighbours).
+
+    - `sorted_indices` is expected to be ascending by distance (self removed).
+    - `bias_exponent` < 1.0 over-represents close neighbours (log-like spacing);
+      `bias_exponent` == 1.0 reduces to even spacing.
+    """
     n = len(sorted_indices)
-    if n == 0:
+    if n == 0 or count <= 0:
         return []
-    picks = []
+
+    # Sample at u_k in (0,1) and compress using u^alpha (alpha<1 concave)
+    alpha = float(bias_exponent)
+    alpha = 1.0 if not np.isfinite(alpha) or alpha <= 0 else alpha
+    picks: List[int] = []
     for k in range(1, count + 1):
-        pos = k / (count + 1)
-        idx = int(round(pos * (n - 1)))
+        u = k / (count + 1)
+        u_biased = u**alpha
+        idx = int(round(u_biased * (n - 1)))
         picks.append(int(sorted_indices[idx]))
-    # deduplicate preserving order
+
+    # Deduplicate preserving order
     seen, out = set(), []
     for i in picks:
         if i not in seen:
@@ -48,13 +66,15 @@ def quantile_indices_from_sorted(sorted_indices: np.ndarray, count: int) -> List
             out.append(i)
     return out[:count]
 
+
 # ---------------------------- Matplotlib widget -------------------------------
+
 
 class MplImage(QtWidgets.QFrame):
     def __init__(self, parent=None, height_px: int = 90):
         super().__init__(parent)
         self.setFrameShape(QtWidgets.QFrame.NoFrame)
-        self.fig = Figure(figsize=(8, height_px/100), dpi=100)
+        self.fig = Figure(figsize=(8, height_px / 100), dpi=100)
         self.canvas = FigureCanvas(self.fig)
         self.ax = self.fig.add_subplot(111)
         self.ax.axis("off")
@@ -63,7 +83,7 @@ class MplImage(QtWidgets.QFrame):
         self.ax.set_position([0, 0, 1, 1])
 
         lay = QtWidgets.QVBoxLayout(self)
-        lay.setContentsMargins(0,0,0,0)
+        lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
         lay.addWidget(self.canvas)
         self.setMinimumHeight(height_px)
@@ -91,17 +111,27 @@ class MplImage(QtWidgets.QFrame):
         if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
             vmin, vmax = float(np.min(img)), float(np.max(img))
 
-        self.ax.imshow(img, aspect='auto', cmap='turbo', vmin=vmin, vmax=vmax)
+        self.ax.imshow(img, aspect="auto", cmap="turbo", vmin=vmin, vmax=vmax)
         self.ax.invert_yaxis()
         self.canvas.draw_idle()
 
+
 # ---------------------------- Proposal row ------------------------------------
+
 
 class ProposalRow(QtWidgets.QFrame):
     labeledChanged = QtCore.Signal()
 
-    def __init__(self, idx: int, spectrogram: np.ndarray, distance: float, bucket: str,
-                 img_height: int, sidepanel_width: int, parent=None):
+    def __init__(
+        self,
+        idx: int,
+        spectrogram: np.ndarray,
+        distance: float,
+        bucket: str,
+        img_height: int,
+        sidepanel_width: int,
+        parent=None,
+    ):
         super().__init__(parent)
         self.idx = int(idx)
         self.bucket = bucket  # "nn" or "quantile"
@@ -120,7 +150,7 @@ class ProposalRow(QtWidgets.QFrame):
         side = QtWidgets.QWidget()
         side.setFixedWidth(sidepanel_width)
         sideLay = QtWidgets.QVBoxLayout(side)
-        sideLay.setContentsMargins(0,0,0,0)
+        sideLay.setContentsMargins(0, 0, 0, 0)
         sideLay.setSpacing(4)
 
         self.chkMatch = QtWidgets.QCheckBox("Match")
@@ -130,7 +160,7 @@ class ProposalRow(QtWidgets.QFrame):
         sideLay.addStretch(1)
 
         row = QtWidgets.QHBoxLayout(self)
-        row.setContentsMargins(2,2,2,2)
+        row.setContentsMargins(2, 2, 2, 2)
         row.setSpacing(6)
         row.addWidget(img, 1)
         row.addWidget(side, 0)
@@ -146,7 +176,9 @@ class ProposalRow(QtWidgets.QFrame):
         self.chkMatch.blockSignals(False)
         self.label = bool(match)
 
+
 # ---------------------------- Main Window -------------------------------------
+
 
 @dataclass
 class LabeledProposal:
@@ -155,6 +187,7 @@ class LabeledProposal:
     bucket: str
     match: bool
 
+
 @dataclass
 class QueryResult:
     query_index: int
@@ -162,8 +195,15 @@ class QueryResult:
     annotator: str
     proposals: List[LabeledProposal]  # order: 20 nn then 20 quantiles
 
+
 class SpectrogramMatcher(QtWidgets.QMainWindow):
-    def __init__(self, h5_path="embeddings.h5", annotator_name: str = "", parent=None):
+    def __init__(
+        self,
+        h5_path: str = "embeddings.h5",
+        annotator_name: str = "",
+        quantile_bias_exponent: float = 0.1,
+        parent=None,
+    ):
         super().__init__(parent)
         self.setWindowTitle("Spectrogram Matcher")
         self.resize(1000, 860)
@@ -178,22 +218,29 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
 
         # In-memory saved labels: query_index -> (proposal_index -> (timestamp, match))
         self._saved_match_state: dict[int, dict[int, Tuple[float, bool]]] = {}
+        # In-memory proposals per query (preserve order as in file/UI)
+        self._query_proposals: dict[int, List[LabeledProposal]] = {}
+        # Timestamp of proposals list per query (latest ingested)
+        self._proposal_timestamp: dict[int, float] = {}
 
         self.num_nn_idx = 20
         self.num_quantile_idx = 20
 
+        # Sampling control
+        self.bias_exponent: float = float(quantile_bias_exponent)
+
         # ----- Layout constants -----
-        IMG_HEIGHT = 90                    # half the previous height
-        SIDEPANEL_WIDTH = 120              # fixed width for checkbox column
+        IMG_HEIGHT = 90  # half the previous height
+        SIDEPANEL_WIDTH = 120  # fixed width for checkbox column
 
         central = QtWidgets.QWidget()
         root = QtWidgets.QVBoxLayout(central)
-        root.setContentsMargins(8,8,8,8)
+        root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(6)
 
         # Top bar (compact)  —— now with Annotator box
         topBar = QtWidgets.QHBoxLayout()
-        topBar.setContentsMargins(0,0,0,0)
+        topBar.setContentsMargins(0, 0, 0, 0)
         topBar.setSpacing(6)
 
         topBar.addWidget(QtWidgets.QLabel("Annotator:"))
@@ -233,7 +280,7 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
         # Query row: image + empty sidepanel placeholder to match proposal width
         queryRowW = QtWidgets.QWidget()
         queryRow = QtWidgets.QHBoxLayout(queryRowW)
-        queryRow.setContentsMargins(2,2,2,2)
+        queryRow.setContentsMargins(2, 2, 2, 2)
         queryRow.setSpacing(6)
 
         self.queryImg = MplImage(height_px=IMG_HEIGHT)
@@ -250,13 +297,13 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
         self.scrollInner = QtWidgets.QWidget()
         self.scroll.setWidget(self.scrollInner)
         self.proposalsLayout = QtWidgets.QVBoxLayout(self.scrollInner)
-        self.proposalsLayout.setContentsMargins(0,0,0,0)
+        self.proposalsLayout.setContentsMargins(0, 0, 0, 0)
         self.proposalsLayout.setSpacing(6)
 
         # assemble
         root.addLayout(topBar)
-        root.addWidget(queryRowW)      # query
-        root.addWidget(self.scroll, 1) # proposals
+        root.addWidget(queryRowW)  # query
+        root.addWidget(self.scroll, 1)  # proposals
 
         self.setCentralWidget(central)
 
@@ -292,23 +339,33 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
 
     def _load_h5(self, path: str) -> Tuple[np.ndarray, np.ndarray]:
         if not os.path.exists(path):
-            QtWidgets.QMessageBox.critical(self, "File not found", f"Cannot find HDF5 at: {path}")
+            QtWidgets.QMessageBox.critical(
+                self, "File not found", f"Cannot find HDF5 at: {path}"
+            )
             sys.exit(1)
         with h5py.File(path, "r") as f:
             if "spectrogram" not in f or "embedding" not in f:
-                QtWidgets.QMessageBox.critical(self, "Invalid file",
-                    "HDF5 must contain datasets 'spectrogram' and 'embedding'.")
+                QtWidgets.QMessageBox.critical(
+                    self,
+                    "Invalid file",
+                    "HDF5 must contain datasets 'spectrogram' and 'embedding'.",
+                )
                 sys.exit(1)
             S = f["spectrogram"][:]
             E = f["embedding"][:]
         if len(S) != len(E):
-            QtWidgets.QMessageBox.critical(self, "Length mismatch",
-                f"'spectrogram' (len={len(S)}) and 'embedding' (len={len(E)}) differ.")
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Length mismatch",
+                f"'spectrogram' (len={len(S)}) and 'embedding' (len={len(E)}) differ.",
+            )
             sys.exit(1)
         return S, E
 
     def open_h5_dialog(self):
-        fn, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open embeddings.h5", "", "HDF5 files (*.h5 *.hdf5)")
+        fn, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Open embeddings.h5", "", "HDF5 files (*.h5 *.hdf5)"
+        )
         if fn:
             self.h5_path = fn
             self.spectrograms, self.embeddings = self._load_h5(self.h5_path)
@@ -332,34 +389,17 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
 
         self.queryImg.show_spectrogram(self.spectrograms[self.current_query])
 
-        # compute proposals
+        # Build proposals for this query (use saved list if available)
+        proposals = self._build_proposals_for_query(self.current_query)
+        # populate proposals according to provided order
         d = self.dist[self.current_query].copy()
-        order = np.argsort(d)
-        order = order[order != self.current_query]  # drop self
-
-        # 20 nearest neighbours
-        nn_idx = [int(i) for i in order[:self.num_nn_idx]]
-
-        # 20 quantiles (spread)
-        quant_idx = quantile_indices_from_sorted(order, self.num_quantile_idx)
-
-        # ensure uniqueness between buckets
-        nn_set = set(nn_idx)
-        q_unique = [int(i) for i in quant_idx if i not in nn_set]
-        if len(q_unique) < 20:
-            for i in order:
-                ii = int(i)
-                if ii not in nn_set and ii not in q_unique:
-                    q_unique.append(ii)
-                    if len(q_unique) == 20:
-                        break
-
-        # populate proposals (single column, no headers)
-        self._populate_proposals(nn_idx, q_unique, d)
-        # Apply any saved matches for this query
+        self._populate_proposals_from_items(proposals, d)
+        # Ensure any saved matches reflected (redundant if already set via items)
         self._apply_saved_matches_for_query(self.current_query)
 
-    def _populate_proposals(self, nn_idx: List[int], q_idx: List[int], dvec: np.ndarray):
+    def _populate_proposals(
+        self, nn_idx: List[int], q_idx: List[int], dvec: np.ndarray
+    ):
         # clear
         while self.proposalsLayout.count():
             item = self.proposalsLayout.takeAt(0)
@@ -369,17 +409,128 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
 
         # add rows (20 nn then 20 quantiles)
         for i in nn_idx + q_idx:
-            row = ProposalRow(idx=i,
-                              spectrogram=self.spectrograms[i],
-                              distance=float(dvec[i]),
-                              bucket=("nn" if i in nn_idx else "quantile"),
-                              img_height=self.IMG_HEIGHT,
-                              sidepanel_width=self.SIDEPANEL_WIDTH)
+            row = ProposalRow(
+                idx=i,
+                spectrogram=self.spectrograms[i],
+                distance=float(dvec[i]),
+                bucket=("nn" if i in nn_idx else "quantile"),
+                img_height=self.IMG_HEIGHT,
+                sidepanel_width=self.SIDEPANEL_WIDTH,
+            )
             # Update Next button enabled and refresh in-memory state + labels
             row.labeledChanged.connect(self._on_any_row_changed)
             self.proposalsLayout.addWidget(row)
 
         self.proposalsLayout.addStretch(1)
+
+    def _populate_proposals_from_items(
+        self, items: List[LabeledProposal], dvec: np.ndarray
+    ):
+        # clear existing
+        while self.proposalsLayout.count():
+            item = self.proposalsLayout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.setParent(None)
+
+        for p in items:
+            i = int(p.index)
+            # Prefer current distance matrix value, fallback to stored
+            dist = (
+                float(dvec[i])
+                if 0 <= i < len(dvec) and np.isfinite(dvec[i])
+                else float(p.distance)
+            )
+            row = ProposalRow(
+                idx=i,
+                spectrogram=self.spectrograms[i],
+                distance=dist,
+                bucket=p.bucket or "",
+                img_height=self.IMG_HEIGHT,
+                sidepanel_width=self.SIDEPANEL_WIDTH,
+            )
+            # Set initial match state from item
+            row.set_match(bool(p.match))
+            row.labeledChanged.connect(self._on_any_row_changed)
+            self.proposalsLayout.addWidget(row)
+
+        self.proposalsLayout.addStretch(1)
+
+    def _build_proposals_for_query(self, q: int) -> List[LabeledProposal]:
+        # If we have a saved ordered list, use it, but update matches from state
+        if q in self._query_proposals:
+            state = self._saved_match_state.get(q, {})
+            items = []
+            for p in self._query_proposals[q]:
+                idx = int(p.index)
+                match = state.get(idx, (0.0, p.match))[1] if state else p.match
+                # Refresh distance from current matrix
+                dist = (
+                    float(self.dist[q, idx]) if 0 <= idx < self.N else float(p.distance)
+                )
+                items.append(
+                    LabeledProposal(
+                        index=idx,
+                        distance=dist,
+                        bucket=str(p.bucket),
+                        match=bool(match),
+                    )
+                )
+            # Order proposals by ascending distance
+            items.sort(key=lambda x: x.distance)
+            return items
+
+        # Otherwise, compute proposals based on distances and current bias
+        d = self.dist[q].copy()
+        order = np.argsort(d)
+        order = order[order != q]  # drop self
+
+        nn_idx = [int(i) for i in order[: self.num_nn_idx]]
+        remainder = order[self.num_nn_idx :]
+        quant_idx = quantile_indices_from_sorted(
+            remainder, self.num_quantile_idx, bias_exponent=self.bias_exponent
+        )
+
+        # ensure uniqueness between buckets
+        nn_set = set(nn_idx)
+        q_unique = [int(i) for i in quant_idx if i not in nn_set]
+        if len(q_unique) < self.num_quantile_idx:
+            for i in remainder:
+                ii = int(i)
+                if ii not in nn_set and ii not in q_unique:
+                    q_unique.append(ii)
+                    if len(q_unique) == self.num_quantile_idx:
+                        break
+
+        # Build items with current match state
+        state = self._saved_match_state.get(q, {})
+        items: List[LabeledProposal] = []
+        for i in nn_idx:
+            items.append(
+                LabeledProposal(
+                    index=i,
+                    distance=float(d[i]),
+                    bucket="nn",
+                    match=bool(state.get(i, (0.0, False))[1] if state else False),
+                )
+            )
+        for i in q_unique:
+            items.append(
+                LabeledProposal(
+                    index=i,
+                    distance=float(d[i]),
+                    bucket="quantile",
+                    match=bool(state.get(i, (0.0, False))[1] if state else False),
+                )
+            )
+
+        # Order proposals by ascending distance
+        items.sort(key=lambda x: x.distance)
+
+        # Cache proposals for this query so future visits remain consistent
+        self._query_proposals[q] = items
+        self._proposal_timestamp[q] = time.time()
+        return items
 
     def _apply_saved_matches_for_query(self, q: int):
         state = self._saved_match_state.get(int(q), {})
@@ -423,12 +574,14 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
         for i in range(self.proposalsLayout.count()):
             w = self.proposalsLayout.itemAt(i).widget()
             if isinstance(w, ProposalRow):
-                labels.append(LabeledProposal(
-                    index=w.idx,
-                    distance=w.distance,
-                    bucket=w.bucket,
-                    match=bool(w.chkMatch.isChecked())
-                ))
+                labels.append(
+                    LabeledProposal(
+                        index=w.idx,
+                        distance=w.distance,
+                        bucket=w.bucket,
+                        match=bool(w.chkMatch.isChecked()),
+                    )
+                )
         return labels
 
     def next_query(self):
@@ -436,7 +589,7 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
             query_index=int(self.current_query),
             timestamp=time.time(),
             annotator=self.annotator_name(),
-            proposals=self._collect_labels()
+            proposals=self._collect_labels(),
         )
         self.results.append(rec)
         # Update in-memory saved state with recency
@@ -456,7 +609,9 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
             pass
         self._cache_current_query_labels()
         self.results_path = self._make_results_filename()
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save results JSON", self.results_path, "JSON (*.json)")
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save results JSON", self.results_path, "JSON (*.json)"
+        )
         if path:
             self.results_path = path
             self._write_results(self.results_path)
@@ -465,6 +620,7 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
         # sanitize annotator name
         import re
         from datetime import datetime
+
         annot = self.annotator_name() or "anon"
         annot = re.sub(r"[^A-Za-z0-9_-]", "_", annot)
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -485,29 +641,59 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
 
     def _state_to_results_list(self) -> List[dict]:
         out: List[dict] = []
-        for q in sorted(self._saved_match_state.keys()):
+        # Include any query that has proposals cached or any saved state
+        queries = sorted(
+            set(self._query_proposals.keys()) | set(self._saved_match_state.keys())
+        )
+        for q in queries:
             state = self._saved_match_state.get(q, {})
-            if not state:
+            # Base proposals come from cached ordered list if available
+            base_props = list(self._query_proposals.get(q, []))
+            # If none, synthesize from saved state indices
+            if not base_props and state:
+                for idx in sorted(state.keys()):
+                    _ts, match = state[idx]
+                    dist = float(self.dist[q, idx]) if 0 <= idx < self.N else 0.0
+                    base_props.append(
+                        LabeledProposal(
+                            index=idx, distance=dist, bucket="", match=bool(match)
+                        )
+                    )
+
+            if not base_props and not state:
+                # Nothing to write for this query
                 continue
-            # Determine a representative timestamp: max over proposals
-            ts_q = max((ts for ts, _ in state.values()), default=time.time())
-            # Build proposals list with distances if available
-            props: List[LabeledProposal] = []
-            # Sort by index for stable output
-            for idx in sorted(state.keys()):
-                ts, match = state[idx]
-                dist = 0.0
-                try:
-                    dist = float(self.dist[q, idx])
-                except Exception:
-                    pass
-                props.append(LabeledProposal(index=idx, distance=dist, bucket="", match=bool(match)))
-            out.append({
-                "query_index": int(q),
-                "timestamp": float(ts_q),
-                "annotator": self.annotator_name(),
-                "proposals": [asdict(p) for p in props],
-            })
+
+            # Timestamp preference: proposals ts, otherwise latest label ts
+            ts_q = self._proposal_timestamp.get(q, 0.0)
+            if ts_q <= 0.0:
+                ts_q = max((ts for ts, _ in state.values()), default=time.time())
+
+            # Merge match values from state into proposal list; refresh distances
+            merged: List[LabeledProposal] = []
+            for p in base_props:
+                idx = int(p.index)
+                match = state.get(idx, (0.0, p.match))[1] if state else p.match
+                dist = (
+                    float(self.dist[q, idx]) if 0 <= idx < self.N else float(p.distance)
+                )
+                merged.append(
+                    LabeledProposal(
+                        index=idx,
+                        distance=dist,
+                        bucket=p.bucket,
+                        match=bool(match),
+                    )
+                )
+
+            out.append(
+                {
+                    "query_index": int(q),
+                    "timestamp": float(ts_q),
+                    "annotator": self.annotator_name(),
+                    "proposals": [asdict(p) for p in merged],
+                }
+            )
         return out
 
     # -------------------- Annotation loading/merging --------------------
@@ -523,11 +709,35 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
             prev = self._saved_match_state[q].get(idx)
             if prev is None or ts >= prev[0]:
                 self._saved_match_state[q][idx] = (ts, match)
+        # Also store proposals list order if provided and newer
+        if rec.proposals:
+            if (q not in self._proposal_timestamp) or (
+                ts >= self._proposal_timestamp[q]
+            ):
+                # Filter proposals within bounds
+                props: List[LabeledProposal] = []
+                for p in rec.proposals:
+                    try:
+                        idx = int(p.index)
+                    except Exception:
+                        continue
+                    if 0 <= idx < self.N:
+                        props.append(
+                            LabeledProposal(
+                                index=idx,
+                                distance=float(p.distance),
+                                bucket=str(p.bucket or ""),
+                                match=bool(p.match),
+                            )
+                        )
+                if props:
+                    self._query_proposals[q] = props
+                    self._proposal_timestamp[q] = ts
 
     def _load_annotations_from_dir(self, directory: str):
         # Load all *.json files that look like results produced by this tool
         try:
-            files = [f for f in os.listdir(directory) if f.lower().endswith('.json')]
+            files = [f for f in os.listdir(directory) if f.lower().endswith(".json")]
         except Exception as e:
             print(f"Warning: cannot list directory {directory}: {e}")
             return
@@ -535,12 +745,12 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
         for fname in files:
             fpath = os.path.join(directory, fname)
             try:
-                with open(fpath, 'r', encoding='utf-8') as f:
+                with open(fpath, "r", encoding="utf-8") as f:
                     data = json.load(f)
             except Exception:
                 continue  # skip non-JSON or unreadable
 
-            if not isinstance(data, dict) or 'results' not in data:
+            if not isinstance(data, dict) or "results" not in data:
                 continue
 
             file_mtime = 0.0
@@ -549,35 +759,44 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
-            results = data.get('results') or []
+            results = data.get("results") or []
             if not isinstance(results, list):
                 continue
 
             for rec in results:
                 try:
-                    q = int(rec.get('query_index'))
+                    q = int(rec.get("query_index"))
                 except Exception:
                     continue
-                ts = rec.get('timestamp')
+                ts = rec.get("timestamp")
                 try:
                     ts = float(ts) if ts is not None else float(file_mtime)
                 except Exception:
                     ts = float(file_mtime)
-                annot = rec.get('proposals') or []
+                annot = rec.get("proposals") or []
                 if not isinstance(annot, list):
                     continue
                 # Build temporary QueryResult-like object to reuse ingest logic
                 props: List[LabeledProposal] = []
                 for p in annot:
                     try:
-                        idx = int(p.get('index'))
+                        idx = int(p.get("index"))
                     except Exception:
                         continue
-                    match = bool(p.get('match', False))
-                    bucket = str(p.get('bucket', ''))
-                    dist = float(p.get('distance', 0.0)) if 'distance' in p else 0.0
-                    props.append(LabeledProposal(index=idx, distance=dist, bucket=bucket, match=match))
-                qr = QueryResult(query_index=q, timestamp=ts, annotator=str(rec.get('annotator', '')), proposals=props)
+                    match = bool(p.get("match", False))
+                    bucket = str(p.get("bucket", ""))
+                    dist = float(p.get("distance", 0.0)) if "distance" in p else 0.0
+                    props.append(
+                        LabeledProposal(
+                            index=idx, distance=dist, bucket=bucket, match=match
+                        )
+                    )
+                qr = QueryResult(
+                    query_index=q,
+                    timestamp=ts,
+                    annotator=str(rec.get("annotator", "")),
+                    proposals=props,
+                )
                 # Guard: only ingest indices within current dataset bounds
                 if 0 <= q < self.N:
                     self._ingest_query_result_into_state(qr)
@@ -594,6 +813,8 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
         # Only ingest changes: new True labels, or toggles relative to saved state
         changed: List[LabeledProposal] = []
         current_state = self._saved_match_state.get(curr, {})
+        # Also capture the current proposals list/order from UI
+        ui_items: List[LabeledProposal] = []
         for i in range(self.proposalsLayout.count()):
             w = self.proposalsLayout.itemAt(i).widget()
             if not isinstance(w, ProposalRow):
@@ -601,17 +822,48 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
             prev = current_state.get(w.idx)
             prev_match = prev[1] if prev is not None else None
             curr_match = bool(w.chkMatch.isChecked())
+            ui_items.append(
+                LabeledProposal(
+                    index=w.idx,
+                    distance=w.distance,
+                    bucket=w.bucket,
+                    match=curr_match,
+                )
+            )
             if prev_match is None:
                 # New: only record True to avoid overwriting with False by default
                 if curr_match:
-                    changed.append(LabeledProposal(index=w.idx, distance=w.distance, bucket=w.bucket, match=True))
+                    changed.append(
+                        LabeledProposal(
+                            index=w.idx,
+                            distance=w.distance,
+                            bucket=w.bucket,
+                            match=True,
+                        )
+                    )
             else:
                 if curr_match != bool(prev_match):
-                    changed.append(LabeledProposal(index=w.idx, distance=w.distance, bucket=w.bucket, match=curr_match))
+                    changed.append(
+                        LabeledProposal(
+                            index=w.idx,
+                            distance=w.distance,
+                            bucket=w.bucket,
+                            match=curr_match,
+                        )
+                    )
 
         if changed:
-            rec = QueryResult(query_index=curr, timestamp=ts, annotator=self.annotator_name(), proposals=changed)
+            rec = QueryResult(
+                query_index=curr,
+                timestamp=ts,
+                annotator=self.annotator_name(),
+                proposals=changed,
+            )
             self._ingest_query_result_into_state(rec)
+        # Always keep proposals list and timestamp in sync with UI
+        if ui_items:
+            self._query_proposals[curr] = ui_items
+            self._proposal_timestamp[curr] = ts
         # Ensure dropdown reflects current query state
         self._update_query_item_label(curr)
 
@@ -636,24 +888,50 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
         for q in range(self.queryCombo.count()):
             self._update_query_item_label(q)
 
+
 # ---------------------------- main --------------------------------------------
+
 
 def main():
     # Parse known args first so Qt doesn't choke on them
     parser = argparse.ArgumentParser(description="Spectrogram Matcher GUI")
-    parser.add_argument("--annotator", dest="annotator", type=str, default="",
-                        help="Annotator name (prefills the GUI and is saved to JSON)")
-    parser.add_argument("--h5", dest="h5_path", type=str, default="embeddings.h5",
-                        help="Path to embeddings HDF5 (default: embeddings.h5)")
+    parser.add_argument(
+        "--annotator",
+        dest="annotator",
+        type=str,
+        default="",
+        help="Annotator name (prefills the GUI and is saved to JSON)",
+    )
+    parser.add_argument(
+        "--h5",
+        dest="h5_path",
+        type=str,
+        default="embeddings.h5",
+        help="Path to embeddings HDF5 (default: embeddings.h5)",
+    )
+    parser.add_argument(
+        "--quantile-bias",
+        dest="quantile_bias",
+        type=float,
+        default=0.1,
+        help=(
+            "Bias exponent for quantile sampling (<1 overrepresents close neighbours; 1=even)"
+        ),
+    )
     args, unknown = parser.parse_known_args()
     # Keep unknown args for Qt
     sys.argv = [sys.argv[0]] + unknown
 
     app = QtWidgets.QApplication(sys.argv)
     app.setStyle("Fusion")
-    win = SpectrogramMatcher(h5_path=args.h5_path, annotator_name=args.annotator)
+    win = SpectrogramMatcher(
+        h5_path=args.h5_path,
+        annotator_name=args.annotator,
+        quantile_bias_exponent=args.quantile_bias,
+    )
     win.show()
     sys.exit(app.exec())
+
 
 if __name__ == "__main__":
     main()
