@@ -145,6 +145,8 @@ class ProposalRow(QtWidgets.QFrame):
 
         img = MplImage(self, height_px=img_height)
         img.show_spectrogram(spectrogram)
+        # Keep a reference for styling when matched
+        self.img = img
 
         # Side panel with only the Match checkbox (metadata removed)
         side = QtWidgets.QWidget()
@@ -167,6 +169,16 @@ class ProposalRow(QtWidgets.QFrame):
 
     def _on_toggle(self, checked: bool):
         self.label = bool(checked)
+        # Update visual emphasis based on match state
+        try:
+            if bool(checked):
+                # Add a salient red frame around the spectrogram
+                self.img.setStyleSheet("border: 3px solid red;")
+            else:
+                # Remove frame when unchecked
+                self.img.setStyleSheet("")
+        except Exception:
+            pass
         self.labeledChanged.emit()
 
     def set_match(self, match: bool):
@@ -175,6 +187,14 @@ class ProposalRow(QtWidgets.QFrame):
         self.chkMatch.setChecked(bool(match))
         self.chkMatch.blockSignals(False)
         self.label = bool(match)
+        # Ensure visual state reflects programmatic changes
+        try:
+            if bool(match):
+                self.img.setStyleSheet("border: 3px solid red;")
+            else:
+                self.img.setStyleSheet("")
+        except Exception:
+            pass
 
 
 # ---------------------------- Main Window -------------------------------------
@@ -202,6 +222,7 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
         h5_path: str = "embeddings.h5",
         annotator_name: str = "",
         quantile_bias_exponent: float = 0.1,
+        quantile_max_distance: Optional[float] = None,
         parent=None,
     ):
         super().__init__(parent)
@@ -228,6 +249,12 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
 
         # Sampling control
         self.bias_exponent: float = float(quantile_bias_exponent)
+        # Optional upper bound for distances when sampling beyond top-k
+        self.max_quantile_distance: Optional[float] = (
+            float(quantile_max_distance)
+            if quantile_max_distance is not None and np.isfinite(quantile_max_distance)
+            else None
+        )
 
         # ----- Layout constants -----
         IMG_HEIGHT = 90  # half the previous height
@@ -487,6 +514,11 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
 
         nn_idx = [int(i) for i in order[: self.num_nn_idx]]
         remainder = order[self.num_nn_idx :]
+        # If a max distance is set, restrict the sampling pool
+        if self.max_quantile_distance is not None:
+            md = float(self.max_quantile_distance)
+            # `order` is sorted by ascending distance; preserve order while filtering
+            remainder = np.array([int(i) for i in remainder if float(d[int(i)]) <= md], dtype=int)
         quant_idx = quantile_indices_from_sorted(
             remainder, self.num_quantile_idx, bias_exponent=self.bias_exponent
         )
@@ -918,6 +950,16 @@ def main():
             "Bias exponent for quantile sampling (<1 overrepresents close neighbours; 1=even)"
         ),
     )
+    parser.add_argument(
+        "--quantile-max-distance",
+        dest="quantile_max_distance",
+        type=float,
+        default=None,
+        help=(
+            "Upper bound on distance for proposals beyond the top-20; "
+            "only candidates with distance <= this value are sampled"
+        ),
+    )
     args, unknown = parser.parse_known_args()
     # Keep unknown args for Qt
     sys.argv = [sys.argv[0]] + unknown
@@ -928,6 +970,7 @@ def main():
         h5_path=args.h5_path,
         annotator_name=args.annotator,
         quantile_bias_exponent=args.quantile_bias,
+        quantile_max_distance=args.quantile_max_distance,
     )
     win.show()
     sys.exit(app.exec())
