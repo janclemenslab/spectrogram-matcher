@@ -67,6 +67,100 @@ def quantile_indices_from_sorted(
     return out[:count]
 
 
+def _time_profile_from_spectrogram(S: np.ndarray, drop_low_freq_bins: int = 35) -> np.ndarray:
+    """
+    Generate a 1D time profile from a 2D spectrogram S with shape (time, freq).
+    Optionally drop the lowest `drop_low_freq_bins` frequency bins which are often
+    dominated by noise. Returns a zero-mean profile.
+    """
+    if S.ndim == 3:
+        S = S[..., 0]
+    S2 = np.asarray(S)
+    # Assume (time, freq); clamp if not enough bins
+    if S2.ndim != 2:
+        S2 = np.squeeze(S2)
+        if S2.ndim != 2:
+            S2 = np.atleast_2d(S2)
+    t, f = S2.shape[0], S2.shape[1]
+    cut = int(drop_low_freq_bins)
+    if cut > 0 and f > cut:
+        S2 = S2[:, cut:]
+    # Average across frequencies for robustness
+    prof = np.mean(S2, axis=1)
+    # Zero-mean, unit variance (guarding small variance)
+    prof = prof - np.mean(prof)
+    std = float(np.std(prof))
+    if std > 1e-8:
+        prof = prof / std
+    return prof.astype(np.float32)
+
+
+def _best_time_shift(a: np.ndarray, b: np.ndarray, max_shift: Optional[int] = None) -> int:
+    """
+    Compute the integer time shift s that best aligns b to a, using normalized
+    cross-correlation of 1D profiles a,b (same length preferred, but not required).
+    Returns s where positive values shift b forward in time (to the right).
+    If max_shift is provided, restrict search to |s| <= max_shift.
+    """
+    a = np.asarray(a).ravel()
+    b = np.asarray(b).ravel()
+    na, nb = a.shape[0], b.shape[0]
+    if na == 0 or nb == 0:
+        return 0
+    # Use full correlation and pick the best lag
+    corr = np.correlate(a, b, mode="full")
+    # Optional windowing of allowable shifts
+    if max_shift is not None:
+        max_shift = int(abs(max_shift))
+        center = nb - 1
+        start = max(0, center - max_shift)
+        end = min(corr.shape[0], center + max_shift + 1)
+        window = corr[start:end]
+        best_local = int(np.argmax(window))
+        best = start + best_local
+    else:
+        best = int(np.argmax(corr))
+    # Convert index in 'full' correlation to shift s for b
+    # In numpy's definition, index == nb-1 corresponds to zero shift.
+    s = best - (nb - 1)
+    return int(s)
+
+
+def _shift_along_time(S: np.ndarray, shift: int) -> np.ndarray:
+    """
+    Shift spectrogram S along time axis (assumed axis 0 for shape (time, freq)).
+    Positive shift moves content forward (to the right when plotted), padding
+    with the minimum value. Keeps the original shape.
+    """
+    if shift == 0:
+        return S
+    X = np.asarray(S)
+    if X.ndim == 3:
+        X = X[..., 0]
+    if X.ndim != 2:
+        X = np.squeeze(X)
+        if X.ndim != 2:
+            X = np.atleast_2d(X)
+    t, f = X.shape
+    out = np.empty_like(X)
+    pad = float(np.min(X)) if np.all(np.isfinite(X)) else 0.0
+    if shift > 0:
+        # pad front, move data later
+        if shift >= t:
+            out[:] = pad
+        else:
+            out[:shift, :] = pad
+            out[shift:, :] = X[: t - shift, :]
+    else:
+        s = -int(shift)
+        if s >= t:
+            out[:] = pad
+        else:
+            out[: t - s, :] = X[s:, :]
+            out[t - s :, :] = pad
+    return out
+
+
 # ---------------------------- Matplotlib widget -------------------------------
 
 
@@ -223,6 +317,7 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
         annotator_name: str = "",
         quantile_bias_exponent: float = 0.1,
         quantile_max_distance: Optional[float] = None,
+        all_nearest: bool = False,
         parent=None,
     ):
         super().__init__(parent)
@@ -255,6 +350,8 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
             if quantile_max_distance is not None and np.isfinite(quantile_max_distance)
             else None
         )
+        # Mode: when True, select top 40 nearest neighbours (no quantile sampling)
+        self.all_nearest: bool = bool(all_nearest)
 
         # ----- Layout constants -----
         IMG_HEIGHT = 90  # half the previous height
@@ -295,13 +392,26 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
         self.btnSave = QtWidgets.QPushButton("Save 💾")
         self.btnSave.clicked.connect(self.save_results)
 
+        self.btnPrev = QtWidgets.QPushButton("◀ Previous")
+        self.btnPrev.clicked.connect(self.prev_query)
+
         self.btnNext = QtWidgets.QPushButton("Next ▶")
         self.btnNext.clicked.connect(self.next_query)
+
+        # Alignment toggle: when enabled, proposals are time-aligned to the query
+        self.alignCheck = QtWidgets.QCheckBox("Align x-corr")
+        self.alignCheck.setToolTip(
+            "Temporally align proposals to the query using spectrogram cross-correlation"
+        )
+        self.alignCheck.setChecked(False)
+        self.alignCheck.toggled.connect(self._on_align_toggled)
 
         topBar.addWidget(self.queryCombo, 1)
         topBar.addWidget(self.btnRandom)
         topBar.addStretch(1)
+        topBar.addWidget(self.alignCheck)
         topBar.addWidget(self.btnSave)
+        topBar.addWidget(self.btnPrev)
         topBar.addWidget(self.btnNext)
 
         # Query row: image + empty sidepanel placeholder to match proposal width
@@ -346,6 +456,11 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+S"), self, activated=self.save_results)
         QtGui.QShortcut(QtGui.QKeySequence("N"), self, activated=self.next_query)
         QtGui.QShortcut(QtGui.QKeySequence("R"), self, activated=self.pick_random_query)
+        QtGui.QShortcut(
+            QtGui.QKeySequence("A"),
+            self,
+            activated=lambda: self.alignCheck.setChecked(not self.alignCheck.isChecked()),
+        )
 
         # initialize
         self.current_query: Optional[int] = None
@@ -361,6 +476,8 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
         self.set_query(0)
         # Reflect annotations in query dropdown labels
         self._refresh_all_query_item_labels()
+        # Internal flag mirrors checkbox
+        self.align_by_xcorr: bool = False
 
     # -------------------- Data loading --------------------
 
@@ -436,9 +553,10 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
 
         # add rows (20 nn then 20 quantiles)
         for i in nn_idx + q_idx:
+            spec = self._get_display_spectrogram_for_index(i)
             row = ProposalRow(
                 idx=i,
-                spectrogram=self.spectrograms[i],
+                spectrogram=spec,
                 distance=float(dvec[i]),
                 bucket=("nn" if i in nn_idx else "quantile"),
                 img_height=self.IMG_HEIGHT,
@@ -468,9 +586,10 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
                 if 0 <= i < len(dvec) and np.isfinite(dvec[i])
                 else float(p.distance)
             )
+            spec = self._get_display_spectrogram_for_index(i)
             row = ProposalRow(
                 idx=i,
-                spectrogram=self.spectrograms[i],
+                spectrogram=spec,
                 distance=dist,
                 bucket=p.bucket or "",
                 img_height=self.IMG_HEIGHT,
@@ -484,8 +603,9 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
         self.proposalsLayout.addStretch(1)
 
     def _build_proposals_for_query(self, q: int) -> List[LabeledProposal]:
-        # If we have a saved ordered list, use it, but update matches from state
-        if q in self._query_proposals:
+        # If we have a saved ordered list and we're not forcing all-nearest mode,
+        # use it but update matches from state
+        if (not self.all_nearest) and (q in self._query_proposals):
             state = self._saved_match_state.get(q, {})
             items = []
             for p in self._query_proposals[q]:
@@ -512,49 +632,66 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
         order = np.argsort(d)
         order = order[order != q]  # drop self
 
-        nn_idx = [int(i) for i in order[: self.num_nn_idx]]
-        remainder = order[self.num_nn_idx :]
-        # If a max distance is set, restrict the sampling pool
-        if self.max_quantile_distance is not None:
-            md = float(self.max_quantile_distance)
-            # `order` is sorted by ascending distance; preserve order while filtering
-            remainder = np.array([int(i) for i in remainder if float(d[int(i)]) <= md], dtype=int)
-        quant_idx = quantile_indices_from_sorted(
-            remainder, self.num_quantile_idx, bias_exponent=self.bias_exponent
-        )
-
-        # ensure uniqueness between buckets
-        nn_set = set(nn_idx)
-        q_unique = [int(i) for i in quant_idx if i not in nn_set]
-        if len(q_unique) < self.num_quantile_idx:
-            for i in remainder:
-                ii = int(i)
-                if ii not in nn_set and ii not in q_unique:
-                    q_unique.append(ii)
-                    if len(q_unique) == self.num_quantile_idx:
-                        break
-
-        # Build items with current match state
+        # Build items depending on selection mode
         state = self._saved_match_state.get(q, {})
         items: List[LabeledProposal] = []
-        for i in nn_idx:
-            items.append(
-                LabeledProposal(
-                    index=i,
-                    distance=float(d[i]),
-                    bucket="nn",
-                    match=bool(state.get(i, (0.0, False))[1] if state else False),
+
+        if self.all_nearest:
+            k = int(self.num_nn_idx + self.num_quantile_idx)
+            topk = [int(i) for i in order[:k]]
+            for i in topk:
+                items.append(
+                    LabeledProposal(
+                        index=int(i),
+                        distance=float(d[int(i)]),
+                        bucket="nn",
+                        match=bool(state.get(int(i), (0.0, False))[1] if state else False),
+                    )
                 )
-            )
-        for i in q_unique:
-            items.append(
-                LabeledProposal(
-                    index=i,
-                    distance=float(d[i]),
-                    bucket="quantile",
-                    match=bool(state.get(i, (0.0, False))[1] if state else False),
+        else:
+            nn_idx = [int(i) for i in order[: self.num_nn_idx]]
+            remainder = order[self.num_nn_idx :]
+            # If a max distance is set, restrict the sampling pool
+            if self.max_quantile_distance is not None:
+                md = float(self.max_quantile_distance)
+                # `order` is sorted by ascending distance; preserve order while filtering
+                remainder = np.array(
+                    [int(i) for i in remainder if float(d[int(i)]) <= md], dtype=int
                 )
+            quant_idx = quantile_indices_from_sorted(
+                remainder, self.num_quantile_idx, bias_exponent=self.bias_exponent
             )
+
+            # ensure uniqueness between buckets
+            nn_set = set(nn_idx)
+            q_unique = [int(i) for i in quant_idx if i not in nn_set]
+            if len(q_unique) < self.num_quantile_idx:
+                for i in remainder:
+                    ii = int(i)
+                    if ii not in nn_set and ii not in q_unique:
+                        q_unique.append(ii)
+                        if len(q_unique) == self.num_quantile_idx:
+                            break
+
+            # Build items with current match state
+            for i in nn_idx:
+                items.append(
+                    LabeledProposal(
+                        index=i,
+                        distance=float(d[i]),
+                        bucket="nn",
+                        match=bool(state.get(i, (0.0, False))[1] if state else False),
+                    )
+                )
+            for i in q_unique:
+                items.append(
+                    LabeledProposal(
+                        index=i,
+                        distance=float(d[i]),
+                        bucket="quantile",
+                        match=bool(state.get(i, (0.0, False))[1] if state else False),
+                    )
+                )
 
         # Order proposals by ascending distance
         items.sort(key=lambda x: x.distance)
@@ -632,6 +769,52 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
         self._write_results(self.results_path)
         nxt = (self.current_query + 1) % self.N
         self.set_query(nxt)
+
+    def prev_query(self):
+        # Cache current labels before switching; do not append to results
+        if self.current_query is not None:
+            self._cache_current_query_labels()
+        prev = (int(self.current_query) - 1) % self.N if self.current_query is not None else 0
+        self.set_query(prev)
+
+    # -------------------- Alignment helpers --------------------
+
+    def _get_display_spectrogram_for_index(self, idx: int) -> np.ndarray:
+        """
+        Return the spectrogram for display. If alignment is enabled, shift the
+        proposal spectrogram along time to best match the current query.
+        """
+        S = self.spectrograms[idx]
+        if not getattr(self, "align_by_xcorr", False):
+            return S
+        try:
+            q_idx = int(self.current_query) if self.current_query is not None else None
+        except Exception:
+            q_idx = None
+        if q_idx is None or not (0 <= q_idx < self.N):
+            return S
+        if idx == q_idx:
+            return S
+        # Compute profiles and best shift
+        prof_q = _time_profile_from_spectrogram(self.spectrograms[q_idx])
+        prof_p = _time_profile_from_spectrogram(S)
+        # Limit maximum tested shift to 25% of the shorter profile length
+        max_shift = int(max(1, min(len(prof_q), len(prof_p)) * 0.25))
+        s = _best_time_shift(prof_q, prof_p, max_shift=max_shift)
+        return _shift_along_time(S, s)
+
+    def _on_align_toggled(self, checked: bool):
+        self.align_by_xcorr = bool(checked)
+        # Refresh all proposal images in-place to reflect alignment state
+        for i in range(self.proposalsLayout.count()):
+            w = self.proposalsLayout.itemAt(i).widget()
+            if not isinstance(w, ProposalRow):
+                continue
+            spec = self._get_display_spectrogram_for_index(w.idx)
+            try:
+                w.img.show_spectrogram(spec)
+            except Exception:
+                pass
 
     def save_results(self):
         # Ensure any pending UI events are processed, then cache current state
@@ -960,6 +1143,14 @@ def main():
             "only candidates with distance <= this value are sampled"
         ),
     )
+    parser.add_argument(
+        "--all-nearest",
+        dest="all_nearest",
+        action="store_true",
+        help=(
+            "Select 40 proposals as the 40 nearest neighbours (ordered by distance)."
+        ),
+    )
     args, unknown = parser.parse_known_args()
     # Keep unknown args for Qt
     sys.argv = [sys.argv[0]] + unknown
@@ -971,6 +1162,7 @@ def main():
         annotator_name=args.annotator,
         quantile_bias_exponent=args.quantile_bias,
         quantile_max_distance=args.quantile_max_distance,
+        all_nearest=args.all_nearest,
     )
     win.show()
     sys.exit(app.exec())

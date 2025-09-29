@@ -39,15 +39,21 @@ Change into the directory with the `spectrogram_matcher.py` and `embeddings.h5` 
 
 ```bash
 conda activate sm
-python spectrogram_matcher.py --annotator YOURNAME [--quantile-bias 0.5] [--quantile-max-distance 0.8]
+python spectrogram_matcher.py \
+  --annotator YOURNAME \
+  [--quantile-bias 0.5] \
+  [--quantile-max-distance 0.8] \
+  [--all-nearest]
 ```
 
 - `--quantile-bias`: bias exponent for quantile sampling. Use values < 1.0
   to overrepresent close neighbours (e.g., 0.5 for log-like spacing). Use 1.0
-  for even spacing.
+ for even spacing.
  - `--quantile-max-distance`: upper bound on distance for proposals beyond
    the top-20 nearest neighbours. Only candidates with distance <= this value
    are considered for the quantile-sampled set.
+ - `--all-nearest`: instead of 20 nearest + 20 quantile-sampled proposals,
+   selects the 40 nearest neighbours, ordered by distance to the query.
 
 
 ## ⌨️ Shortcuts
