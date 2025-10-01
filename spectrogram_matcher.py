@@ -414,7 +414,7 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
         topBar.addWidget(self.btnPrev)
         topBar.addWidget(self.btnNext)
 
-        # Query row: image + empty sidepanel placeholder to match proposal width
+        # Query row: image + sidepanel with query-level controls
         queryRowW = QtWidgets.QWidget()
         queryRow = QtWidgets.QHBoxLayout(queryRowW)
         queryRow.setContentsMargins(2, 2, 2, 2)
@@ -423,9 +423,27 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
         self.queryImg = MplImage(height_px=IMG_HEIGHT)
         queryRow.addWidget(self.queryImg, 1)
 
-        querySidePlaceholder = QtWidgets.QWidget()
-        querySidePlaceholder.setFixedWidth(SIDEPANEL_WIDTH)
-        queryRow.addWidget(querySidePlaceholder)
+        # Right-side panel for query-level checkbox (No matches)
+        querySide = QtWidgets.QWidget()
+        querySide.setFixedWidth(SIDEPANEL_WIDTH)
+        qSideLay = QtWidgets.QVBoxLayout(querySide)
+        qSideLay.setContentsMargins(0, 0, 0, 0)
+        qSideLay.setSpacing(4)
+
+        self.noMatchesCheck = QtWidgets.QCheckBox("No matches")
+        self.noMatchesCheck.setChecked(False)
+        self.noMatchesCheck.setToolTip("Mark this query as having no matching proposals")
+        self.noMatchesCheck.toggled.connect(self._on_no_matches_toggled)
+        qSideLay.addWidget(self.noMatchesCheck, 0, Qt.AlignTop)
+
+        self.ignoreCheck = QtWidgets.QCheckBox("Ignore")
+        self.ignoreCheck.setChecked(False)
+        self.ignoreCheck.setToolTip("Ignore this query (skip during review)")
+        self.ignoreCheck.toggled.connect(self._on_ignore_toggled)
+        qSideLay.addWidget(self.ignoreCheck, 0, Qt.AlignTop)
+        qSideLay.addStretch(1)
+
+        queryRow.addWidget(querySide)
 
         # Scrollable proposals area
         self.scroll = QtWidgets.QScrollArea()
@@ -466,6 +484,10 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
         self.current_query: Optional[int] = None
         self.IMG_HEIGHT = IMG_HEIGHT
         self.SIDEPANEL_WIDTH = SIDEPANEL_WIDTH
+        # Per-query flag for explicit "no matches"
+        self._no_match_queries: dict[int, Tuple[float, bool]] = {}
+        # Per-query flag for ignoring a query
+        self._ignored_queries: dict[int, Tuple[float, bool]] = {}
         # Load any existing annotations from JSON files in CWD
         try:
             self._load_annotations_from_dir(os.getcwd())
@@ -540,6 +562,17 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
         self._populate_proposals_from_items(proposals, d)
         # Ensure any saved matches reflected (redundant if already set via items)
         self._apply_saved_matches_for_query(self.current_query)
+        # Restore query-level no-matches state
+        nm = bool(self._no_match_queries.get(self.current_query, (0.0, False))[1])
+        ig = bool(self._ignored_queries.get(self.current_query, (0.0, False))[1])
+        self.noMatchesCheck.blockSignals(True)
+        self.noMatchesCheck.setChecked(nm)
+        self.noMatchesCheck.blockSignals(False)
+        self.ignoreCheck.blockSignals(True)
+        self.ignoreCheck.setChecked(ig)
+        self.ignoreCheck.blockSignals(False)
+        # Apply combined UI disabling rule
+        self._apply_no_matches_ui_state(nm or ig)
 
     def _populate_proposals(
         self, nn_idx: List[int], q_idx: List[int], dvec: np.ndarray
@@ -716,6 +749,18 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
         self.btnNext.setEnabled(True)
 
     def _on_any_row_changed(self):
+        # If any proposal is checked, clear the query-level no-matches flag
+        any_true = False
+        for i in range(self.proposalsLayout.count()):
+            w = self.proposalsLayout.itemAt(i).widget()
+            if isinstance(w, ProposalRow) and bool(w.chkMatch.isChecked()):
+                any_true = True
+                break
+        if any_true and self.noMatchesCheck.isChecked():
+            self.noMatchesCheck.blockSignals(True)
+            self.noMatchesCheck.setChecked(False)
+            self.noMatchesCheck.blockSignals(False)
+            self._apply_no_matches_ui_state(False)
         # Enable Next and cache current labels to state (with timestamp)
         self._noop_update_next()
         self._cache_current_query_labels()
@@ -754,6 +799,8 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
         return labels
 
     def next_query(self):
+        # Cache current UI state, including query-level no-matches flag
+        self._cache_current_query_labels()
         rec = QueryResult(
             query_index=int(self.current_query),
             timestamp=time.time(),
@@ -816,6 +863,44 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
+    # -------------------- No matches (query-level) --------------------
+
+    def _apply_no_matches_ui_state(self, _=None):
+        # Disable/enable proposal list when marking no matches or ignored
+        try:
+            nm = bool(self.noMatchesCheck.isChecked()) if hasattr(self, "noMatchesCheck") else False
+            ig = bool(self.ignoreCheck.isChecked()) if hasattr(self, "ignoreCheck") else False
+            self.scrollInner.setDisabled(bool(nm or ig))
+        except Exception:
+            pass
+
+    def _on_no_matches_toggled(self, checked: bool):
+        # If marking no matches, clear all proposal matches and disable UI
+        if bool(checked):
+            for i in range(self.proposalsLayout.count()):
+                w = self.proposalsLayout.itemAt(i).widget()
+                if isinstance(w, ProposalRow):
+                    w.set_match(False)
+        self._apply_no_matches_ui_state(bool(checked))
+        # Cache immediately and enable Next
+        self._noop_update_next()
+        self._cache_current_query_labels()
+        if self.current_query is not None:
+            self._update_query_item_label(int(self.current_query))
+
+    def _on_ignore_toggled(self, checked: bool):
+        # Ignoring a query disables proposals; also clear matches for consistency
+        if bool(checked):
+            for i in range(self.proposalsLayout.count()):
+                w = self.proposalsLayout.itemAt(i).widget()
+                if isinstance(w, ProposalRow):
+                    w.set_match(False)
+        self._apply_no_matches_ui_state(bool(checked))
+        self._noop_update_next()
+        self._cache_current_query_labels()
+        if self.current_query is not None:
+            self._update_query_item_label(int(self.current_query))
+
     def save_results(self):
         # Ensure any pending UI events are processed, then cache current state
         try:
@@ -858,7 +943,10 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
         out: List[dict] = []
         # Include any query that has proposals cached or any saved state
         queries = sorted(
-            set(self._query_proposals.keys()) | set(self._saved_match_state.keys())
+            set(self._query_proposals.keys())
+            | set(self._saved_match_state.keys())
+            | set(self._no_match_queries.keys())
+            | set(self._ignored_queries.keys())
         )
         for q in queries:
             state = self._saved_match_state.get(q, {})
@@ -876,13 +964,24 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
                     )
 
             if not base_props and not state:
-                # Nothing to write for this query
-                continue
+                # Still serialize query if it has explicit no-matches/ignored mark
+                if not (
+                    bool(self._no_match_queries.get(q, (0.0, False))[1])
+                    or bool(self._ignored_queries.get(q, (0.0, False))[1])
+                ):
+                    continue
 
             # Timestamp preference: proposals ts, otherwise latest label ts
             ts_q = self._proposal_timestamp.get(q, 0.0)
             if ts_q <= 0.0:
-                ts_q = max((ts for ts, _ in state.values()), default=time.time())
+                ts_q = max(
+                    (
+                        [ts for ts, _ in state.values()]
+                        + ([self._no_match_queries[q][0]] if q in self._no_match_queries else [])
+                        + ([self._ignored_queries[q][0]] if q in self._ignored_queries else [])
+                    )
+                    or [time.time()]
+                )
 
             # Merge match values from state into proposal list; refresh distances
             merged: List[LabeledProposal] = []
@@ -901,14 +1000,18 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
                     )
                 )
 
-            out.append(
-                {
-                    "query_index": int(q),
-                    "timestamp": float(ts_q),
-                    "annotator": self.annotator_name(),
-                    "proposals": [asdict(p) for p in merged],
-                }
-            )
+            rec = {
+                "query_index": int(q),
+                "timestamp": float(ts_q),
+                "annotator": self.annotator_name(),
+                "proposals": [asdict(p) for p in merged],
+            }
+            # Include explicit flags when set
+            if bool(self._no_match_queries.get(q, (0.0, False))[1]):
+                rec["no_matches"] = True
+            if bool(self._ignored_queries.get(q, (0.0, False))[1]):
+                rec["ignored"] = True
+            out.append(rec)
         return out
 
     # -------------------- Annotation loading/merging --------------------
@@ -924,6 +1027,24 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
             prev = self._saved_match_state[q].get(idx)
             if prev is None or ts >= prev[0]:
                 self._saved_match_state[q][idx] = (ts, match)
+        # Ingest optional no_matches flag if present on record
+        if hasattr(rec, "no_matches"):
+            try:
+                nm = bool(getattr(rec, "no_matches"))
+                prev_nm = self._no_match_queries.get(q)
+                if prev_nm is None or ts >= prev_nm[0]:
+                    self._no_match_queries[q] = (ts, nm)
+            except Exception:
+                pass
+        # Ingest optional ignored flag if present on the record
+        if hasattr(rec, "ignored"):
+            try:
+                ig = bool(getattr(rec, "ignored"))
+                prev_ig = self._ignored_queries.get(q)
+                if prev_ig is None or ts >= prev_ig[0]:
+                    self._ignored_queries[q] = (ts, ig)
+            except Exception:
+                pass
         # Also store proposals list order if provided and newer
         if rec.proposals:
             if (q not in self._proposal_timestamp) or (
@@ -1012,6 +1133,16 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
                     annotator=str(rec.get("annotator", "")),
                     proposals=props,
                 )
+                # Inject no_matches flag if present
+                try:
+                    setattr(qr, "no_matches", bool(rec.get("no_matches", False)))
+                except Exception:
+                    pass
+                # Inject ignored flag if present
+                try:
+                    setattr(qr, "ignored", bool(rec.get("ignored", False)))
+                except Exception:
+                    pass
                 # Guard: only ingest indices within current dataset bounds
                 if 0 <= q < self.N:
                     self._ingest_query_result_into_state(qr)
@@ -1079,6 +1210,24 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
         if ui_items:
             self._query_proposals[curr] = ui_items
             self._proposal_timestamp[curr] = ts
+        # Cache query-level no-matches flag
+        try:
+            nm_flag = bool(self.noMatchesCheck.isChecked())
+        except Exception:
+            nm_flag = False
+        prev_nm = self._no_match_queries.get(curr)
+        prev_val = prev_nm[1] if prev_nm is not None else None
+        if prev_val is None or bool(prev_val) != nm_flag:
+            self._no_match_queries[curr] = (ts, nm_flag)
+        # Cache query-level ignored flag
+        try:
+            ig_flag = bool(self.ignoreCheck.isChecked())
+        except Exception:
+            ig_flag = False
+        prev_ig = self._ignored_queries.get(curr)
+        prev_ig_val = prev_ig[1] if prev_ig is not None else None
+        if prev_ig_val is None or bool(prev_ig_val) != ig_flag:
+            self._ignored_queries[curr] = (ts, ig_flag)
         # Ensure dropdown reflects current query state
         self._update_query_item_label(curr)
 
@@ -1092,7 +1241,16 @@ class SpectrogramMatcher(QtWidgets.QMainWindow):
         return False
 
     def _format_query_item_text(self, q: int) -> str:
-        mark = "✓ " if self._query_has_any_match(q) else ""
+        # Marker precedence: ignored > no-matches > any-match
+        ig = bool(self._ignored_queries.get(int(q), (0.0, False))[1])
+        if ig:
+            mark = "X "
+        else:
+            nm = bool(self._no_match_queries.get(int(q), (0.0, False))[1])
+            if nm:
+                mark = "∅ "
+            else:
+                mark = "✓ " if self._query_has_any_match(q) else ""
         return f"{mark}{q}"
 
     def _update_query_item_label(self, q: int):
